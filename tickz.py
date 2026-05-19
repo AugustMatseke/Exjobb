@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from abc import ABC, abstractmethod
 from scipy.ndimage import label
 from scipy.optimize import milp, LinearConstraint, Bounds
 from scipy.sparse import coo_matrix
@@ -12,7 +13,113 @@ FOUR_NEIGHBOR_STRUCTURE = np.array([
 ], dtype=int)
 
 
-def has_four_neighbor(grid, r, c):
+# ---------------------------------------------------------------------------
+# Solver interface
+# ---------------------------------------------------------------------------
+
+class Solver(ABC):
+    """Base class for strip-cover solvers.
+
+    Subclasses must implement solve(), returning a list of strip dicts with keys:
+      - orientation: "H" or "V"
+      - cells: list of (row, col) tuples covered by this strip
+      - For "H": r, c0, c1
+      - For "V": c, r0, r1
+    """
+
+    @abstractmethod
+    def solve(self, grid: np.ndarray) -> list[dict]:
+        ...
+
+
+class MILPSolver(Solver):
+    """Minimum single-width rectangle cover via Mixed Integer Linear Programming."""
+
+    def solve(self, grid: np.ndarray) -> list[dict]:
+        candidates = self._generate_candidates(grid)
+        occupied_cells = [(r, c) for r, c in np.argwhere(grid == 1)]
+        if not occupied_cells:
+            return []
+
+        num_cells = len(occupied_cells)
+        num_candidates = len(candidates)
+        cell_to_row = {cell: idx for idx, cell in enumerate(occupied_cells)}
+
+        data, row_idx, col_idx = [], [], []
+        for j, candidate in enumerate(candidates):
+            for cell in candidate["cells"]:
+                i = cell_to_row.get(cell)
+                if i is not None:
+                    row_idx.append(i)
+                    col_idx.append(j)
+                    data.append(1.0)
+
+        a = coo_matrix((data, (row_idx, col_idx)), shape=(num_cells, num_candidates))
+        constraints = LinearConstraint(a, lb=np.ones(num_cells), ub=np.ones(num_cells))
+        bounds = Bounds(lb=np.zeros(num_candidates), ub=np.ones(num_candidates))
+        integrality = np.ones(num_candidates, dtype=int)
+
+        result = milp(
+            c=np.ones(num_candidates),
+            constraints=constraints,
+            integrality=integrality,
+            bounds=bounds,
+        )
+
+        if not result.success:
+            raise RuntimeError(f"MILP failed: {result.message}")
+
+        selected = np.where(result.x > 0.5)[0]
+        return [candidates[i] for i in selected]
+
+    def _generate_candidates(self, grid: np.ndarray) -> list[dict]:
+        rows, cols = grid.shape
+        candidates = []
+
+        for r in range(rows):
+            c = 0
+            while c < cols:
+                if grid[r, c] == 1:
+                    start = c
+                    while c < cols and grid[r, c] == 1:
+                        c += 1
+                    end = c - 1
+                    for left in range(start, end + 1):
+                        for right in range(left, end + 1):
+                            candidates.append({
+                                "orientation": "H",
+                                "r": r, "c0": left, "c1": right,
+                                "cells": [(r, cc) for cc in range(left, right + 1)],
+                            })
+                else:
+                    c += 1
+
+        for c in range(cols):
+            r = 0
+            while r < rows:
+                if grid[r, c] == 1:
+                    start = r
+                    while r < rows and grid[r, c] == 1:
+                        r += 1
+                    end = r - 1
+                    for top in range(start, end + 1):
+                        for bottom in range(top, end + 1):
+                            candidates.append({
+                                "orientation": "V",
+                                "c": c, "r0": top, "r1": bottom,
+                                "cells": [(rr, c) for rr in range(top, bottom + 1)],
+                            })
+                else:
+                    r += 1
+
+        return candidates
+
+
+# ---------------------------------------------------------------------------
+# Grid generation
+# ---------------------------------------------------------------------------
+
+def _has_four_neighbor(grid, r, c):
     return (
         grid[r - 1, c] == 1
         or grid[r + 1, c] == 1
@@ -20,229 +127,155 @@ def has_four_neighbor(grid, r, c):
         or grid[r, c + 1] == 1
     )
 
-def generate_tikz_contour(grid_size=20, hole_size=2):
-    # 1. Initialize empty grid
-    grid = np.zeros((grid_size, grid_size), dtype=int)
-    
-    # 2. Create a random connected blob (Drunken Walk Expansion)
-    center = grid_size // 2
-    grid[center-2:center+2, center-2:center+2] = 1 # Seed core
-    
-    for _ in range(60): # Randomly expand edges
-        edges = []
-        for r in range(1, grid_size-1):
-            for c in range(1, grid_size-1):
-                if grid[r, c] == 0:
-                    # 4-neighbor adjacency only (side-sharing, no corner-only links)
-                    if has_four_neighbor(grid, r, c):
-                        edges.append((r, c))
-        if edges:
-            idx = np.random.choice(len(edges))
-            grid[edges[idx]] = 1
 
-    # 3. Punch a hole
-    # We find an "inner" point that is surrounded by 1s
-    possible_holes = []
-    for r in range(2, grid_size-2):
-        for c in range(2, grid_size-2):
-            if np.all(grid[r-1:r+2, c-1:c+2] == 1):
-                possible_holes.append((r, c))
-    
+def generate_grid(grid_size=20, hole_size=2) -> np.ndarray:
+    grid = np.zeros((grid_size, grid_size), dtype=int)
+    center = grid_size // 2
+    grid[center - 2:center + 2, center - 2:center + 2] = 1
+
+    for _ in range(60):
+        edges = [
+            (r, c)
+            for r in range(1, grid_size - 1)
+            for c in range(1, grid_size - 1)
+            if grid[r, c] == 0 and _has_four_neighbor(grid, r, c)
+        ]
+        if edges:
+            grid[edges[np.random.choice(len(edges))]] = 1
+
+    possible_holes = [
+        (r, c)
+        for r in range(2, grid_size - 2)
+        for c in range(2, grid_size - 2)
+        if np.all(grid[r - 1:r + 2, c - 1:c + 2] == 1)
+    ]
     if possible_holes:
         hr, hc = possible_holes[np.random.choice(len(possible_holes))]
-        grid[hr:hr+hole_size, hc:hc+hole_size] = 0
+        grid[hr:hr + hole_size, hc:hc + hole_size] = 0
 
-    # Keep only the largest 4-connected component to avoid corner-connected outliers.
     labeled, num_labels = label(grid, structure=FOUR_NEIGHBOR_STRUCTURE)
     if num_labels > 1:
-        component_sizes = np.bincount(labeled.ravel())
-        component_sizes[0] = 0
-        largest_component = component_sizes.argmax()
-        grid = (labeled == largest_component).astype(int)
-    
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0
+        grid = (labeled == sizes.argmax()).astype(int)
+
     return grid
 
-def extract_tikz_path(grid):
-    """
-    Rudimentary boundary tracer for orthogonal (Manhattan) paths.
-    Returns a string formatted for TikZ: (x,y) -- (x,y) ...
-    """
-    # For a production tool, you'd use a proper wall-following algorithm.
-    # Here we'll visualize the grid to let you pick coordinates or 
-    # use this logic to see the 'occupied' blocks.
+
+# ---------------------------------------------------------------------------
+# TikZ output
+# ---------------------------------------------------------------------------
+
+def _merge_segments(segments):
+    merged = []
+    for key, start, end in sorted(segments):
+        if not merged or merged[-1][0] != key or start > merged[-1][2]:
+            merged.append([key, start, end])
+        else:
+            merged[-1][2] = max(merged[-1][2], end)
+    return merged
+
+
+def grid_to_tikz(grid: np.ndarray, strips: list[dict]) -> str:
     rows, cols = grid.shape
 
-    print("\n--- TIKZ COORDINATE HINT ---")
-    print("Cells marked 1 (Occupied):")
+    h_segs, v_segs = [], []
     for r in range(rows):
         for c in range(cols):
-            if grid[r,c] == 1:
-                print(f"({c},{r}) ", end="")
-        print("")
+            if grid[r, c] != 1:
+                continue
+            if r == 0 or grid[r - 1, c] == 0:
+                h_segs.append((r, c, c + 1))
+            if r == rows - 1 or grid[r + 1, c] == 0:
+                h_segs.append((r + 1, c, c + 1))
+            if c == 0 or grid[r, c - 1] == 0:
+                v_segs.append((c, r, r + 1))
+            if c == cols - 1 or grid[r, c + 1] == 0:
+                v_segs.append((c + 1, r, r + 1))
+
+    h_segs = _merge_segments(h_segs)
+    v_segs = _merge_segments(v_segs)
+
+    lines = ["\\begin{tikzpicture}[scale=0.6, line cap=round]"]
+
+    lines.append("    % Contour")
+    for y, x1, x2 in h_segs:
+        lines.append(f"    \\draw[black, very thick] ({x1}, {y}) -- ({x2}, {y});")
+    for x, y1, y2 in v_segs:
+        lines.append(f"    \\draw[black, very thick] ({x}, {y1}) -- ({x}, {y2});")
+
+    h_strips = [s for s in strips if s["orientation"] == "H"]
+    v_strips = [s for s in strips if s["orientation"] == "V"]
+
+    # if h_strips:
+    #     lines.append("")
+    #     lines.append("    % Horizontal strips")
+    #     for s in h_strips:
+    #         y = s["r"] + 0.5
+    #         x1, x2 = s["c0"], s["c1"] + 1
+    #         lines.append(f"    \\draw[black, thick] ({x1}, {y}) -- ({x2}, {y});")
+
+    # if v_strips:
+    #     lines.append("")
+    #     lines.append("    % Vertical strips")
+    #     for s in v_strips:
+    #         x = s["c"] + 0.5
+    #         y1, y2 = s["r0"], s["r1"] + 1
+    #         lines.append(f"    \\draw[black, thick] ({x}, {y1}) -- ({x}, {y2});")
+
+    lines.append("\\end{tikzpicture}")
+    return "\n".join(lines)
 
 
-def generate_single_width_candidates(grid):
-    rows, cols = grid.shape
-    candidates = []
+# ---------------------------------------------------------------------------
+# Matplotlib visualisation
+# ---------------------------------------------------------------------------
 
-    # Horizontal 1xk rectangles
-    for r in range(rows):
-        c = 0
-        while c < cols:
-            if grid[r, c] == 1:
-                start = c
-                while c < cols and grid[r, c] == 1:
-                    c += 1
-                end = c - 1
-                for left in range(start, end + 1):
-                    for right in range(left, end + 1):
-                        cells = [(r, cc) for cc in range(left, right + 1)]
-                        candidates.append({
-                            "orientation": "H",
-                            "r": r,
-                            "c0": left,
-                            "c1": right,
-                            "cells": cells,
-                        })
-            else:
-                c += 1
-
-    # Vertical kx1 rectangles
-    for c in range(cols):
-        r = 0
-        while r < rows:
-            if grid[r, c] == 1:
-                start = r
-                while r < rows and grid[r, c] == 1:
-                    r += 1
-                end = r - 1
-                for top in range(start, end + 1):
-                    for bottom in range(top, end + 1):
-                        cells = [(rr, c) for rr in range(top, bottom + 1)]
-                        candidates.append({
-                            "orientation": "V",
-                            "c": c,
-                            "r0": top,
-                            "r1": bottom,
-                            "cells": cells,
-                        })
-            else:
-                r += 1
-
-    return candidates
-
-
-def minimum_single_width_rectangle_cover(grid):
-    occupied_cells = [(r, c) for r, c in np.argwhere(grid == 1)]
-    if not occupied_cells:
-        return [], None
-
-    candidates = generate_single_width_candidates(grid)
-    num_cells = len(occupied_cells)
-    num_candidates = len(candidates)
-
-    cell_to_row = {cell: idx for idx, cell in enumerate(occupied_cells)}
-
-    data = []
-    row_idx = []
-    col_idx = []
-    for j, candidate in enumerate(candidates):
-        for cell in candidate["cells"]:
-            i = cell_to_row.get(cell)
-            if i is not None:
-                row_idx.append(i)
-                col_idx.append(j)
-                data.append(1.0)
-
-    a = coo_matrix((data, (row_idx, col_idx)), shape=(num_cells, num_candidates))
-
-    constraints = LinearConstraint(a, lb=np.ones(num_cells), ub=np.ones(num_cells))
-    objective = np.ones(num_candidates)
-    bounds = Bounds(lb=np.zeros(num_candidates), ub=np.ones(num_candidates))
-    integrality = np.ones(num_candidates, dtype=int)
-
-    result = milp(
-        c=objective,
-        constraints=constraints,
-        integrality=integrality,
-        bounds=bounds,
-    )
-
-    if not result.success:
-        raise RuntimeError(f"MILP failed to find a decomposition: {result.message}")
-
-    selected_indices = np.where(result.x > 0.5)[0]
-    return [candidates[idx] for idx in selected_indices], result
-
-
-def draw_grid(ax, grid, title):
+def _draw_grid(ax, grid, title):
     rows, cols = grid.shape
     ax.imshow(grid, origin='lower', cmap='Greys', interpolation='nearest', vmin=0, vmax=1)
     ax.set_xlim(-0.5, cols - 0.5)
     ax.set_ylim(-0.5, rows - 0.5)
-    ax.set_aspect('equal', adjustable='box')
-
-    # Explicitly draw a 1x1 white border around every cell.
+    ax.set_aspect('equal')
     for r in range(rows):
         for c in range(cols):
-            cell_border = plt.Rectangle(
-                (c - 0.5, r - 0.5),
-                1,
-                1,
-                fill=False,
-                edgecolor='white',
-                linewidth=0.8,
-                zorder=5,
-            )
-            ax.add_patch(cell_border)
-
+            ax.add_patch(plt.Rectangle(
+                (c - 0.5, r - 0.5), 1, 1,
+                fill=False, edgecolor='white', linewidth=0.8, zorder=5,
+            ))
     ax.set_xticks(np.arange(0, cols, 1))
     ax.set_yticks(np.arange(0, rows, 1))
     ax.set_title(title)
 
 
-def plot_rectangle_cover(ax, grid, rectangles):
-    draw_grid(ax, grid, f"Minimum Non-Overlapping Single-Width Rectangles: {len(rectangles)}")
-
-    cmap = plt.get_cmap("tab20")
-    for i, rect in enumerate(rectangles):
-        color = cmap(i % 20)
-        for r, c in rect["cells"]:
-            cell = plt.Rectangle(
-                (c - 0.5, r - 0.5),
-                1,
-                1,
-                facecolor=color,
-                edgecolor='white',
-                linewidth=0.8,
-                alpha=0.45,
-            )
-            ax.add_patch(cell)
-
-
-def plot_side_by_side(grid, rectangles):
+def plot_result(grid, strips):
     _, axes = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
-    draw_grid(axes[0], grid, "Random Partitioning Target")
-    plot_rectangle_cover(axes[1], grid, rectangles)
+    _draw_grid(axes[0], grid, "Grid")
+
+    _draw_grid(axes[1], grid, f"Strip cover ({len(strips)} strips)")
+    cmap = plt.get_cmap("tab20")
+    for i, s in enumerate(strips):
+        color = cmap(i % 20)
+        for r, c in s["cells"]:
+            axes[1].add_patch(plt.Rectangle(
+                (c - 0.5, r - 0.5), 1, 1,
+                facecolor=color, edgecolor='white', linewidth=0.8, alpha=0.45,
+            ))
+
     plt.show()
 
-# Run it
-grid = generate_tikz_contour()
-extract_tikz_path(grid)
-rectangles, milp_result = minimum_single_width_rectangle_cover(grid)
-plot_side_by_side(grid, rectangles)
 
-print(f"\nMinimum number of single-width non-overlapping rectangles: {len(rectangles)}")
-if milp_result is not None:
-    mip_gap = getattr(milp_result, "mip_gap", None)
-    print(f"Solver status: {milp_result.status}")
-    print(f"Solver message: {milp_result.message}")
-    if mip_gap is not None:
-        print(f"MILP relative gap: {mip_gap:.3e}")
-        print("Global optimum certified:" + (" yes" if mip_gap <= 1e-9 else " no (gap > 0)"))
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-for idx, rect in enumerate(rectangles, start=1):
-    if rect["orientation"] == "H":
-        print(f"{idx:02d}. H: row={rect['r']}, cols={rect['c0']}..{rect['c1']}")
-    else:
-        print(f"{idx:02d}. V: col={rect['c']}, rows={rect['r0']}..{rect['r1']}")
+if __name__ == "__main__":
+    grid = generate_grid()
+    solver = MILPSolver()
+    strips = solver.solve(grid)
+
+    print(grid_to_tikz(grid, strips))
+    print(f"\n% {len(strips)} strips used")
+
+    plot_result(grid, strips)
+    
