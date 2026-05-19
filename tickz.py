@@ -116,6 +116,341 @@ class MILPSolver(Solver):
 
 
 # ---------------------------------------------------------------------------
+# Rectangle-partition solver
+# ---------------------------------------------------------------------------
+
+class RectPartitionSolver(Solver):
+    """Minimum strip cover via rectangle partition using concave-vertex matching."""
+
+    def solve(self, grid: np.ndarray) -> list[dict]:
+        concave = self._find_concave_vertices(grid)
+        diagonals = self._find_good_diagonals(grid, concave)
+        matching = self._solve_matching(concave, diagonals)
+        chords = self._place_chords(grid, concave, diagonals, matching)
+        rects = self._extract_rectangles(grid, chords)
+        return self._rects_to_strips(rects)
+
+    # ------------------------------------------------------------------
+    # Step 1: concave vertices
+    # ------------------------------------------------------------------
+
+    def _find_concave_vertices(self, grid: np.ndarray) -> list[tuple[int, int]]:
+        rows, cols = grid.shape
+        concave = []
+        for cy in range(rows + 1):
+            for cx in range(cols + 1):
+                tl = int(grid[cy - 1, cx - 1] == 1) if cy > 0 and cx > 0 else 0
+                tr = int(grid[cy - 1, cx]     == 1) if cy > 0 and cx < cols else 0
+                bl = int(grid[cy,     cx - 1] == 1) if cy < rows and cx > 0 else 0
+                br = int(grid[cy,     cx]     == 1) if cy < rows and cx < cols else 0
+                if tl + tr + bl + br == 3:
+                    concave.append((cx, cy))
+        return concave
+
+    # ------------------------------------------------------------------
+    # Step 2: good diagonals
+    # ------------------------------------------------------------------
+
+    def _find_good_diagonals(
+        self, grid: np.ndarray, concave: list[tuple[int, int]]
+    ) -> list[tuple[int, int, int, int]]:
+        rows, cols = grid.shape
+        vertex_set = set(concave)
+        diagonals = []
+
+        # Group by row (horizontal chords) and by column (vertical chords)
+        by_row: dict[int, list[int]] = {}
+        by_col: dict[int, list[int]] = {}
+        for cx, cy in concave:
+            by_row.setdefault(cy, []).append(cx)
+            by_col.setdefault(cx, []).append(cy)
+
+        for cy, xs in by_row.items():
+            if cy == 0 or cy == rows:
+                continue
+            for i, cx1 in enumerate(xs):
+                for cx2 in xs[i + 1:]:
+                    a, b = min(cx1, cx2), max(cx1, cx2)
+                    if all(
+                        grid[cy - 1, cx] == 1 and grid[cy, cx] == 1
+                        for cx in range(a, b)
+                    ):
+                        diagonals.append((a, cy, b, cy))
+
+        for cx, ys in by_col.items():
+            if cx == 0 or cx == cols:
+                continue
+            for i, cy1 in enumerate(ys):
+                for cy2 in ys[i + 1:]:
+                    a, b = min(cy1, cy2), max(cy1, cy2)
+                    if all(
+                        grid[cy, cx - 1] == 1 and grid[cy, cx] == 1
+                        for cy in range(a, b)
+                    ):
+                        diagonals.append((cx, a, cx, b))
+
+        return diagonals
+
+    # ------------------------------------------------------------------
+    # Step 3 & 4: adjacency matrix + maximum matching
+    # ------------------------------------------------------------------
+
+    def _solve_matching(
+        self,
+        concave: list[tuple[int, int]],
+        diagonals: list[tuple[int, int, int, int]],
+    ) -> dict[int, int]:
+        idx = {v: i for i, v in enumerate(concave)}
+        n = len(concave)
+        adj: list[list[int]] = [[] for _ in range(n)]
+        for cx1, cy1, cx2, cy2 in diagonals:
+            u = idx.get((cx1, cy1))
+            v = idx.get((cx2, cy2))
+            if u is not None and v is not None:
+                adj[u].append(v)
+                adj[v].append(u)
+
+        # Augmenting-path matching (general graph, simple O(VE))
+        match = [-1] * n
+
+        def try_augment(u: int, visited: list[bool]) -> bool:
+            for v in adj[u]:
+                if not visited[v]:
+                    visited[v] = True
+                    if match[v] == -1 or try_augment(match[v], visited):
+                        match[u] = v
+                        match[v] = u
+                        return True
+            return False
+
+        for u in range(n):
+            if match[u] == -1:
+                visited = [False] * n
+                visited[u] = True
+                try_augment(u, visited)
+
+        return {u: match[u] for u in range(n) if match[u] != -1}
+
+    # ------------------------------------------------------------------
+    # Step 5: place chords
+    # ------------------------------------------------------------------
+
+    def _place_chords(
+        self,
+        grid: np.ndarray,
+        concave: list[tuple[int, int]],
+        diagonals: list[tuple[int, int, int, int]],
+        matching: dict,
+    ) -> list[tuple[int, int, int, int]]:
+        rows, cols = grid.shape
+        chords: list[tuple[int, int, int, int]] = []
+        used = set()
+
+        # Build a lookup: pair of vertex coords -> diagonal
+        diag_lookup: dict[tuple, tuple] = {}
+        for d in diagonals:
+            cx1, cy1, cx2, cy2 = d
+            diag_lookup[((cx1, cy1), (cx2, cy2))] = d
+            diag_lookup[((cx2, cy2), (cx1, cy1))] = d
+
+        # Matched pairs
+        for u, v in matching.items():
+            if u < v:
+                pu, pv = concave[u], concave[v]
+                d = diag_lookup.get((pu, pv)) or diag_lookup.get((pv, pu))
+                if d:
+                    chords.append(d)
+                    used.add(u)
+                    used.add(v)
+
+        # Unmatched: extend to boundary
+        for i, (cx, cy) in enumerate(concave):
+            if i in used:
+                continue
+            # Determine which cell is empty (the reflex direction)
+            tl = int(grid[cy - 1, cx - 1] == 1) if cy > 0 and cx > 0 else 0
+            tr = int(grid[cy - 1, cx]     == 1) if cy > 0 and cx < cols else 0
+            bl = int(grid[cy,     cx - 1] == 1) if cy < rows and cx > 0 else 0
+            br = int(grid[cy,     cx]     == 1) if cy < rows and cx < cols else 0
+
+            # Try horizontal extension first, then vertical
+            chord = self._extend_to_boundary(grid, cx, cy, tl, tr, bl, br)
+            if chord:
+                chords.append(chord)
+
+        return chords
+
+    def _extend_to_boundary(
+        self,
+        grid: np.ndarray,
+        cx: int, cy: int,
+        tl: bool, tr: bool, bl: bool, br: bool,
+    ) -> tuple[int, int, int, int] | None:
+        rows, cols = grid.shape
+
+        def h_chord(cx_start, cx_end, cy_fixed):
+            a, b = min(cx_start, cx_end), max(cx_start, cx_end)
+            if cy_fixed == 0 or cy_fixed == rows:
+                return None
+            if all(
+                grid[cy_fixed - 1, x] == 1 and grid[cy_fixed, x] == 1
+                for x in range(a, b)
+            ):
+                return (a, cy_fixed, b, cy_fixed)
+            return None
+
+        def v_chord(cx_fixed, cy_start, cy_end):
+            a, b = min(cy_start, cy_end), max(cy_start, cy_end)
+            if cx_fixed == 0 or cx_fixed == cols:
+                return None
+            if all(
+                grid[y, cx_fixed - 1] == 1 and grid[y, cx_fixed] == 1
+                for y in range(a, b)
+            ):
+                return (cx_fixed, a, cx_fixed, b)
+            return None
+
+        # Which directions are valid for this concave vertex
+        # empty quadrant determines valid extension axes
+        empty_tl = not tl
+        empty_tr = not tr
+        empty_bl = not bl
+        empty_br = not br
+
+        candidates = []
+
+        # Horizontal: sweep left to find boundary, sweep right to find boundary
+        for dx in range(1, cols + 1):
+            nx = cx - dx
+            if nx < 0:
+                break
+            c = h_chord(nx, cx, cy)
+            if c:
+                candidates.append(c)
+                break
+        for dx in range(1, cols + 1):
+            nx = cx + dx
+            if nx > cols:
+                break
+            c = h_chord(cx, nx, cy)
+            if c:
+                candidates.append(c)
+                break
+
+        # Vertical: sweep up/down
+        for dy in range(1, rows + 1):
+            ny = cy - dy
+            if ny < 0:
+                break
+            c = v_chord(cx, ny, cy)
+            if c:
+                candidates.append(c)
+                break
+        for dy in range(1, rows + 1):
+            ny = cy + dy
+            if ny > rows:
+                break
+            c = v_chord(cx, cy, ny)
+            if c:
+                candidates.append(c)
+                break
+
+        if not candidates:
+            return None
+        # Pick shortest chord
+        def length(d):
+            return abs(d[2] - d[0]) + abs(d[3] - d[1])
+        return min(candidates, key=length)
+
+    # ------------------------------------------------------------------
+    # Step 6: extract rectangles via flood-fill
+    # ------------------------------------------------------------------
+
+    def _extract_rectangles(
+        self,
+        grid: np.ndarray,
+        chords: list[tuple[int, int, int, int]],
+    ) -> list[tuple[int, int, int, int]]:
+        rows, cols = grid.shape
+
+        # h_walls[cy][cx] = True means there is a cut on the top edge of cell (cy, cx)
+        # i.e., between row cy-1 and row cy at column cx
+        h_walls = [[False] * cols for _ in range(rows + 1)]
+        v_walls = [[False] * (cols + 1) for _ in range(rows)]
+
+        for cx1, cy1, cx2, cy2 in chords:
+            if cy1 == cy2:  # horizontal chord at corner-row cy1
+                cy = cy1
+                for cx in range(cx1, cx2):
+                    if 0 < cy < rows:
+                        h_walls[cy][cx] = True
+            else:           # vertical chord at corner-col cx1
+                cx = cx1
+                for cy in range(cy1, cy2):
+                    if 0 < cx < cols:
+                        v_walls[cy][cx] = True
+
+        visited = np.zeros((rows, cols), dtype=bool)
+        rects = []
+
+        for r0 in range(rows):
+            for c0 in range(cols):
+                if grid[r0, c0] != 1 or visited[r0, c0]:
+                    continue
+                # Expand right
+                c1 = c0
+                while c1 + 1 < cols and grid[r0, c1 + 1] == 1 and not v_walls[r0][c1 + 1]:
+                    c1 += 1
+                # Expand down: all rows must have the same column span and no h-wall
+                r1 = r0
+                while r1 + 1 < rows:
+                    next_r = r1 + 1
+                    # Check h-wall on top of next row for all cols in [c0, c1]
+                    if any(h_walls[next_r][cx] for cx in range(c0, c1 + 1)):
+                        break
+                    # Check all cells in next row exist and no v-wall cuts within span
+                    if any(grid[next_r, cx] != 1 for cx in range(c0, c1 + 1)):
+                        break
+                    if any(v_walls[next_r][cx] for cx in range(c0 + 1, c1 + 1)):
+                        break
+                    r1 = next_r
+
+                visited[r0:r1 + 1, c0:c1 + 1] = True
+                rects.append((r0, r1, c0, c1))
+
+        return rects
+
+    # ------------------------------------------------------------------
+    # Step 7: rectangles → strips
+    # ------------------------------------------------------------------
+
+    def _rects_to_strips(
+        self, rects: list[tuple[int, int, int, int]]
+    ) -> list[dict]:
+        strips = []
+        for rect_id, (r0, r1, c0, c1) in enumerate(rects):
+            h = r1 - r0 + 1
+            w = c1 - c0 + 1
+            if h <= w:
+                for r in range(r0, r1 + 1):
+                    strips.append({
+                        "orientation": "H",
+                        "r": r, "c0": c0, "c1": c1,
+                        "cells": [(r, c) for c in range(c0, c1 + 1)],
+                        "rect_id": rect_id,
+                    })
+            else:
+                for c in range(c0, c1 + 1):
+                    strips.append({
+                        "orientation": "V",
+                        "c": c, "r0": r0, "r1": r1,
+                        "cells": [(r, c) for r in range(r0, r1 + 1)],
+                        "rect_id": rect_id,
+                    })
+        return strips
+
+
+# ---------------------------------------------------------------------------
 # Grid generation
 # ---------------------------------------------------------------------------
 
@@ -196,32 +531,31 @@ def grid_to_tikz(grid: np.ndarray, strips: list[dict]) -> str:
     h_segs = _merge_segments(h_segs)
     v_segs = _merge_segments(v_segs)
 
-    lines = ["\\begin{tikzpicture}[scale=0.6, line cap=round]"]
-
-    lines.append("    % Contour")
-    for y, x1, x2 in h_segs:
-        lines.append(f"    \\draw[black, very thick] ({x1}, {y}) -- ({x2}, {y});")
-    for x, y1, y2 in v_segs:
-        lines.append(f"    \\draw[black, very thick] ({x}, {y1}) -- ({x}, {y2});")
-
     h_strips = [s for s in strips if s["orientation"] == "H"]
     v_strips = [s for s in strips if s["orientation"] == "V"]
 
-    # if h_strips:
-    #     lines.append("")
-    #     lines.append("    % Horizontal strips")
-    #     for s in h_strips:
-    #         y = s["r"] + 0.5
-    #         x1, x2 = s["c0"], s["c1"] + 1
-    #         lines.append(f"    \\draw[black, thick] ({x1}, {y}) -- ({x2}, {y});")
+    lines = ["\\begin{tikzpicture}[scale=0.6, line cap=round]"]
 
-    # if v_strips:
-    #     lines.append("")
-    #     lines.append("    % Vertical strips")
-    #     for s in v_strips:
-    #         x = s["c"] + 0.5
-    #         y1, y2 = s["r0"], s["r1"] + 1
-    #         lines.append(f"    \\draw[black, thick] ({x}, {y1}) -- ({x}, {y2});")
+    if h_strips or v_strips:
+        lines.append("    % Strips")
+        for s in h_strips:
+            r, c0, c1 = s["r"], s["c0"], s["c1"]
+            lines.append(
+                f"    \\filldraw[fill=gray!20, draw=gray!60, line width=0.4pt]"
+                f" ({c0},{r}) rectangle ({c1 + 1},{r + 1});"
+            )
+        for s in v_strips:
+            c, r0, r1 = s["c"], s["r0"], s["r1"]
+            lines.append(
+                f"    \\filldraw[fill=gray!20, draw=gray!60, line width=0.4pt]"
+                f" ({c},{r0}) rectangle ({c + 1},{r1 + 1});"
+            )
+
+    lines.append("    % Contour")
+    for y, x1, x2 in h_segs:
+        lines.append(f"    \\draw[black, very thick] ({x1},{y}) -- ({x2},{y});")
+    for x, y1, y2 in v_segs:
+        lines.append(f"    \\draw[black, very thick] ({x},{y1}) -- ({x},{y2});")
 
     lines.append("\\end{tikzpicture}")
     return "\n".join(lines)
@@ -248,19 +582,25 @@ def _draw_grid(ax, grid, title):
     ax.set_title(title)
 
 
-def plot_result(grid, strips):
-    _, axes = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
-    _draw_grid(axes[0], grid, "Grid")
-
-    _draw_grid(axes[1], grid, f"Strip cover ({len(strips)} strips)")
+def _color_strips(ax, strips):
     cmap = plt.get_cmap("tab20")
     for i, s in enumerate(strips):
         color = cmap(i % 20)
         for r, c in s["cells"]:
-            axes[1].add_patch(plt.Rectangle(
+            ax.add_patch(plt.Rectangle(
                 (c - 0.5, r - 0.5), 1, 1,
                 facecolor=color, edgecolor='white', linewidth=0.8, alpha=0.45,
             ))
+
+
+def plot_all(grid, milp_strips, rect_strips):
+    _, axes = plt.subplots(1, 3, figsize=(16.8, 5.6), constrained_layout=True)
+
+    _draw_grid(axes[0], grid, "Grid")
+    _draw_grid(axes[1], grid, f"MILP ({len(milp_strips)} strips)")
+    _color_strips(axes[1], milp_strips)
+    _draw_grid(axes[2], grid, f"Rect Partition ({len(rect_strips)} strips)")
+    _color_strips(axes[2], rect_strips)
 
     plt.show()
 
@@ -270,12 +610,14 @@ def plot_result(grid, strips):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    grid = generate_grid()
-    solver = MILPSolver()
-    strips = solver.solve(grid)
+    grid = generate_grid(hole_size=3)
 
-    print(grid_to_tikz(grid, strips))
-    print(f"\n% {len(strips)} strips used")
+    milp_strips = MILPSolver().solve(grid)
+    rect_strips = RectPartitionSolver().solve(grid)
 
-    plot_result(grid, strips)
+    print(grid_to_tikz(grid, milp_strips))
+    print(f"\nMILP:          {len(milp_strips)} strips")
+    print(f"RectPartition: {len(rect_strips)} strips")
+
+    plot_all(grid, milp_strips, rect_strips)
     
