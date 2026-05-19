@@ -123,12 +123,14 @@ class RectPartitionSolver(Solver):
     """Minimum strip cover via rectangle partition using concave-vertex matching."""
 
     def solve(self, grid: np.ndarray) -> list[dict]:
+        return self._rects_to_strips(self.solve_rects(grid))
+
+    def solve_rects(self, grid: np.ndarray) -> list[tuple[int, int, int, int]]:
         concave = self._find_concave_vertices(grid)
         diagonals = self._find_good_diagonals(grid, concave)
         matching = self._solve_matching(concave, diagonals)
         chords = self._place_chords(grid, concave, diagonals, matching)
-        rects = self._extract_rectangles(grid, chords)
-        return self._rects_to_strips(rects)
+        return self._extract_rectangles(grid, chords)
 
     # ------------------------------------------------------------------
     # Step 1: concave vertices
@@ -593,14 +595,26 @@ def _color_strips(ax, strips):
             ))
 
 
-def plot_all(grid, milp_strips, rect_strips):
-    _, axes = plt.subplots(1, 3, figsize=(16.8, 5.6), constrained_layout=True)
+def _color_rects(ax, rects):
+    cmap = plt.get_cmap("tab20")
+    for i, (r0, r1, c0, c1) in enumerate(rects):
+        color = cmap(i % 20)
+        ax.add_patch(plt.Rectangle(
+            (c0 - 0.5, r0 - 0.5), c1 - c0 + 1, r1 - r0 + 1,
+            facecolor=color, edgecolor='white', linewidth=1.2, alpha=0.45,
+        ))
 
-    _draw_grid(axes[0], grid, "Grid")
-    _draw_grid(axes[1], grid, f"MILP ({len(milp_strips)} strips)")
-    _color_strips(axes[1], milp_strips)
-    _draw_grid(axes[2], grid, f"Rect Partition ({len(rect_strips)} strips)")
-    _color_strips(axes[2], rect_strips)
+
+def plot_all(grid, milp_strips, rects, rect_strips):
+    _, axes = plt.subplots(2, 2, figsize=(11.2, 11.2), constrained_layout=True)
+
+    _draw_grid(axes[0, 0], grid, "Grid")
+    _draw_grid(axes[0, 1], grid, f"MILP ({len(milp_strips)} strips)")
+    _color_strips(axes[0, 1], milp_strips)
+    _draw_grid(axes[1, 0], grid, f"Minimum rectangles ({len(rects)})")
+    _color_rects(axes[1, 0], rects)
+    _draw_grid(axes[1, 1], grid, f"Rect partition strips ({len(rect_strips)})")
+    _color_strips(axes[1, 1], rect_strips)
 
     plt.show()
 
@@ -613,11 +627,14 @@ if __name__ == "__main__":
     grid = generate_grid(hole_size=3)
 
     milp_strips = MILPSolver().solve(grid)
-    rect_strips = RectPartitionSolver().solve(grid)
+    rect_solver = RectPartitionSolver()
+    rects = rect_solver.solve_rects(grid)
+    rect_strips = rect_solver._rects_to_strips(rects)
 
     print(grid_to_tikz(grid, milp_strips))
     print(f"\nMILP:          {len(milp_strips)} strips")
+    print(f"Rectangles:    {len(rects)}")
     print(f"RectPartition: {len(rect_strips)} strips")
 
-    plot_all(grid, milp_strips, rect_strips)
+    plot_all(grid, milp_strips, rects, rect_strips)
     
